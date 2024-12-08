@@ -3,7 +3,7 @@ import socket
 import argparse
 from struct import pack
 
-DEFAULT_PORT = 69
+DEFAULT_PORT = 7540
 BLOCK_SIZE = 512
 DEFAULT_TRANSFER_MODE = 'octet'
 TIMEOUT = 5
