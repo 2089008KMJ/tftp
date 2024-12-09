@@ -1,126 +1,130 @@
-import os
+#!/usr/bin/python3
 import socket
-import argparse
-from struct import pack
+import struct
+import os
 
-DEFAULT_PORT = 7540
-BLOCK_SIZE = 512
-DEFAULT_TRANSFER_MODE = 'octet'
-TIMEOUT = 5
+TFTP_OPCODE_READ = 1
+TFTP_OPCODE_WRITE = 2
+TFTP_OPCODE_DATA = 3
+TFTP_OPCODE_ACK = 4
+TFTP_OPCODE_ERROR = 5
 
-OPCODE = {'RRQ': 1, 'WRQ': 2, 'DATA': 3, 'ACK': 4, 'ERROR': 5}
+TFTP_PACKET_SIZE = 516
+TFTP_DATA_BLOCK_SIZE = 512
+TFTP_SOCKET_TIMEOUT = 5
+TFTP_DEFAULT_PORT = 7540
+TFTP_TRANSFER_MODE = "octet"
 
-ERROR_CODE = {
-    0: "Not defined, see error message (if any).",
-    1: "File not found.",
-    2: "Access violation.",
-    3: "Disk full or allocation exceeded.",
-    4: "Illegal TFTP operation.",
-    5: "Unknown transfer ID.",
-    6: "File already exists.",
-    7: "No such user."
-}
-
-
-def send_rrq(sock, server_address, filename, mode):
-    """Send RRQ (Read Request) to the server."""
-    format = f'>h{len(filename)}sB{len(mode)}sB'
-    rrq_message = pack(format, OPCODE['RRQ'], bytes(filename, 'utf-8'), 0, bytes(mode, 'utf-8'), 0)
-    sock.sendto(rrq_message, server_address)
+MESSAGE_TIMEOUT = "데이터 대기 중 타임아웃 발생."
+MESSAGE_ACK_TIMEOUT = "ACK 응답 대기 중 타임아웃 발생."
+MESSAGE_UNEXPECTED_RESPONSE = "예상치 못한 응답 또는 블록 번호 불일치."
+MESSAGE_FILE_NOT_FOUND = "'{file_name}' 파일을 찾을 수 없습니다."
 
 
-def send_wrq(sock, server_address, filename, mode):
-    """Send WRQ (Write Request) to the server."""
-    format = f'>h{len(filename)}sB{len(mode)}sB'
-    wrq_message = pack(format, OPCODE['WRQ'], bytes(filename, 'utf-8'), 0, bytes(mode, 'utf-8'), 0)
-    sock.sendto(wrq_message, server_address)
+def build_tftp_request(opcode, file_name, transfer_mode=TFTP_TRANSFER_MODE):
+    return struct.pack(f"!H{len(file_name) + 1}s{len(transfer_mode) + 1}s", opcode, file_name.encode(), transfer_mode.encode())
 
 
-def receive_file(sock, filename):
-    """Handle file download (get)."""
-    with open(filename, 'wb') as file:
-        expected_block = 1
+def build_tftp_ack(block_number):
+    return struct.pack("!HH", TFTP_OPCODE_ACK, block_number)
+
+
+def parse_tftp_data(packet):
+    opcode, block_number = struct.unpack("!HH", packet[:4])
+    data = packet[4:]
+    return opcode, block_number, data
+
+
+def tftp_upload_file(socket_instance, file_name, server_address):
+    if not os.path.exists(file_name):
+        print(MESSAGE_FILE_NOT_FOUND.format(file_name=file_name))
+        return
+
+    block_number = 0
+    with open(file_name, 'rb') as file:
         while True:
+            data_chunk = file.read(TFTP_DATA_BLOCK_SIZE)
+            block_number += 1
+            packet = struct.pack("!HH", TFTP_OPCODE_DATA, block_number) + data_chunk
+            socket_instance.sendto(packet, server_address)
+
             try:
-                data, server = sock.recvfrom(516)
-                opcode = int.from_bytes(data[:2], 'big')
-
-                if opcode == OPCODE['DATA']:
-                    block_number = int.from_bytes(data[2:4], 'big')
-                    if block_number == expected_block:
-                        send_ack(sock, block_number, server)
-                        file_block = data[4:]
-                        file.write(file_block)
-                        expected_block += 1
-
-                        if len(file_block) < BLOCK_SIZE:
-                            print("File transfer completed.")
-                            break
-                elif opcode == OPCODE['ERROR']:
-                    error_code = int.from_bytes(data[2:4], 'big')
-                    print(ERROR_CODE.get(error_code, "Unknown error."))
+                response, _ = socket_instance.recvfrom(TFTP_PACKET_SIZE)
+                opcode, ack_block = struct.unpack("!HH", response[:4])
+                if opcode != TFTP_OPCODE_ACK or ack_block != block_number:
+                    print(MESSAGE_UNEXPECTED_RESPONSE)
                     break
-
             except socket.timeout:
-                print("Timeout waiting for DATA.")
+                print(MESSAGE_ACK_TIMEOUT)
+                break
+
+            if len(data_chunk) < TFTP_DATA_BLOCK_SIZE:
+                print("업로드 완료.")
                 break
 
 
-def send_file(sock, filename):
-    """Handle file upload (put)."""
-    try:
-        with open(filename, 'rb') as file:
-            block_number = 0
-            while True:
-                block_number += 1
-                data_block = file.read(BLOCK_SIZE)
-                data_message = pack('>hh', OPCODE['DATA'], block_number) + data_block
-                sock.sendto(data_message, server_address)
+def tftp_download_file(socket_instance, file_name, server_address):
+    block_number = 0
+    with open(file_name, 'wb') as file:
+        while True:
+            try:
+                response, _ = socket_instance.recvfrom(TFTP_PACKET_SIZE)
+                opcode, received_block, data_chunk = parse_tftp_data(response)
 
-                try:
-                    ack, _ = sock.recvfrom(516)
-                    ack_opcode = int.from_bytes(ack[:2], 'big')
-                    ack_block = int.from_bytes(ack[2:4], 'big')
-
-                    if ack_opcode == OPCODE['ACK'] and ack_block == block_number:
-                        if len(data_block) < BLOCK_SIZE:
-                            print("File transfer completed.")
-                            break
-
-                except socket.timeout:
-                    print("Timeout waiting for ACK.")
+                if opcode != TFTP_OPCODE_DATA or received_block != block_number + 1:
+                    print(MESSAGE_UNEXPECTED_RESPONSE)
                     break
 
-    except FileNotFoundError:
-        print("File not found for upload.")
+                file.write(data_chunk)
+                block_number = received_block
+                ack_packet = build_tftp_ack(block_number)
+                socket_instance.sendto(ack_packet, server_address)
 
+                if len(data_chunk) < TFTP_DATA_BLOCK_SIZE:
+                    print("다운로드 완료.")
+                    break
 
-def send_ack(sock, block_number, server):
-    """Send ACK for received data block."""
-    ack_message = pack('>hh', OPCODE['ACK'], block_number)
-    sock.sendto(ack_message, server)
+            except socket.timeout:
+                print(MESSAGE_TIMEOUT)
+                break
 
 
 def main():
-    parser = argparse.ArgumentParser(description="TFTP Client")
-    parser.add_argument("host", help="Server IP address", type=str)
-    parser.add_argument("operation", help="get or put", choices=["get", "put"])
-    parser.add_argument("filename", help="File to transfer", type=str)
-    parser.add_argument("-p", "--port", help="Server port", type=int, default=DEFAULT_PORT)
-    args = parser.parse_args()
+    print("=== TFTP 클라이언트 ===")
 
-    server_address = (args.host, args.port)
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    sock.settimeout(TIMEOUT)
+    server_ip = input("TFTP 서버 IP를 입력하세요: ").strip()
+    server_port = input(f"TFTP 서버 포트 번호를 입력하세요 : ").strip()
+    server_port = int(server_port) if server_port else TFTP_DEFAULT_PORT
 
-    if args.operation == "get":
-        send_rrq(sock, server_address, args.filename, DEFAULT_TRANSFER_MODE)
-        receive_file(sock, args.filename)
-    elif args.operation == "put":
-        send_wrq(sock, server_address, args.filename, DEFAULT_TRANSFER_MODE)
-        send_file(sock, args.filename)
+    operation_type = input("수행할 작업을 입력하세요 [get|put]: ").strip().lower()
+    file_name = input("파일 이름을 입력하세요: ").strip()
 
-    sock.close()
+    if not server_ip or not file_name or operation_type not in ['get', 'put']:
+        print("잘못된 입력입니다. 올바른 IP, 작업, 파일 이름을 입력하세요.")
+        return
+
+    server_address = (server_ip, server_port)
+    socket_instance = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    socket_instance.settimeout(TFTP_SOCKET_TIMEOUT)
+
+    try:
+        if operation_type == "get":
+            print(f"'{file_name}' 파일을 {server_ip}:{server_port}에서 다운로드 중...")
+            request_packet = build_tftp_request(TFTP_OPCODE_READ, file_name)
+            socket_instance.sendto(request_packet, server_address)
+            tftp_download_file(socket_instance, file_name, server_address)
+
+        elif operation_type == "put":
+            print(f"'{file_name}' 파일을 {server_ip}:{server_port}로 업로드 중...")
+            request_packet = build_tftp_request(TFTP_OPCODE_WRITE, file_name)
+            socket_instance.sendto(request_packet, server_address)
+            tftp_upload_file(socket_instance, file_name, server_address)
+
+    except Exception as e:
+        print(f"오류 발생: {e}")
+    finally:
+        socket_instance.close()
+        print("연결을 종료합니다.")
 
 
 if __name__ == "__main__":
